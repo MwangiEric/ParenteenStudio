@@ -14,6 +14,9 @@ import os
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
+API_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(API_DIR)
+
 # YouTube URL parser
 def extract_video_id(url: str) -> str:
     patterns = [
@@ -121,3 +124,12 @@ async def generate_image(quote: str = Form(...)):
 @app.get("/api/health")
 async def health():
     return {"status": "healthy"}
+
+# ---------- STATIC FILES MOUNTING ----------
+static_path = os.path.join(API_DIR, "static")
+if os.path.exists(static_path):
+    app.mount("/", StaticFiles(directory=static_path, html=True), name="static")
+else:
+    @app.get("/")
+    def index_missing():
+        return {"error": "Static folder not found", "checked": static_path}
