@@ -1,81 +1,123 @@
-import os
+from fastapi import FastAPI, Request, Form, Response
+from fastapi.templating import Jinja2Templates
+from youtube_transcript_api import YouTubeTranscriptApi
+import re
+import json
+import textwrap
+from PIL import Image, ImageDraw
+import io
 import cv2
 import numpy as np
-import requests
-import textwrap
-from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
-from fastapi import FastAPI, Response, Request, Form
-from fastapi.templating import Jinja2Templates
-from groq import Groq
 import tempfile
+import os
 
 app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
-# Setup Jinja2 Templates
-templates = Jinja2Templates(directory="api/templates")
+# YouTube URL parser
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r'youtube\.com/shorts/([^?&]+)',
+        r'youtube\.com/watch\?v=([^?&]+)',
+        r'youtu\.be/([^?&]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return url
 
-# Configuration
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-LOGO_URL = "https://ik.imagekit.io/ericmwangi/cropped-Parenteen-Kenya-Logo-rec.png"
-
-# --- GROQ QUOTE GENERATION ---
-def generate_groq_quotes():
-    client = Groq(api_key=GROQ_API_KEY)
-    prompt = "Generate 5 short, impactful parenting quotes for teenagers. Keep them under 15 words each."
-    
-    completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    # Basic parsing (assumes numbered list)
-    quotes = completion.choices[0].message.content.split('\n')
-    return [q.strip() for q in quotes if q.strip() and any(char.isdigit() for char in q[:2])]
-
-# --- VIDEO ENGINE (Simplified with Brand Colors) ---
-def create_video(text: str):
-    width, height = 1080, 1920
-    fps, duration = 12, 6
-    
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video = cv2.VideoWriter(tmp.name, fourcc, fps, (width, height))
+def get_insightful_quotes(video_id: str) -> list:
+    """Extract best quotes from YouTube video"""
+    try:
+        transcript = YouTubeTranscriptApi().fetch(video_id, languages=['en'])
         
-        # Pre-wrap text
-        wrapped = "\n".join(textwrap.wrap(text, width=20))
-
-        for i in range(fps * duration):
-            # Use ParenTeen Brand Color: bg_dark (#1E1B4B)
-            img = Image.new('RGB', (width, height), color=(30, 27, 75)) 
-            draw = ImageDraw.Draw(img)
+        # Score segments for insightfulness
+        quotes = []
+        insight_keywords = [
+            'important', 'key', 'crucial', 'essential', 'remember', 'understand',
+            'realize', 'discover', 'breakthrough', 'insight', 'lesson', 'wisdom',
+            'experience', 'advice', 'perspective', 'meaning', 'purpose'
+        ]
+        
+        for segment in transcript:
+            text = segment.text.strip()
+            score = 0
             
-            # Draw Logo (Centered at top)
-            # (In production, download logo once and reuse)
+            # Score based on keywords and length
+            text_lower = text.lower()
+            for keyword in insight_keywords:
+                score += text_lower.count(keyword) * 10
             
-            # Draw Quote
-            draw.multiline_text((width//2, height//2), wrapped, fill=(255,255,255), anchor="mm", align="center")
-            
-            # Draw Author (Jane Kariuki)
-            draw.text((width//2, height//2 + 200), "- Jane Kariuki, Teen Psychologist", fill=(236, 72, 153), anchor="mm")
+            if 20 < len(text) < 120 and score > 0:
+                quotes.append({
+                    'text': text,
+                    'timestamp': segment.start,
+                    'youtube_url': f"https://www.youtube.com/watch?v={video_id}&t={int(segment.start)}s",
+                    'score': score
+                })
+        
+        # Sort by score and return top 8
+        quotes.sort(key=lambda x: x['score'], reverse=True)
+        return quotes[:8]
+        
+    except Exception as e:
+        return [{'text': f'Error: {str(e)}', 'timestamp': 0, 'youtube_url': '', 'score': 0}]
 
-            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            video.write(frame)
-
-        video.release()
-        return tmp.name
-
-# --- ROUTES ---
+def create_quote_image(text: str) -> bytes:
+    """Create branded quote image"""
+    width, height = 1080, 1080
+    
+    # Create base image
+    img = Image.new('RGB', (width, height), color=(30, 27, 75))
+    draw = ImageDraw.Draw(img)
+    
+    # Wrap text
+    wrapped_lines = textwrap.wrap(text, width=25)
+    
+    # Draw main text
+    text_y = height // 2
+    for i, line in enumerate(wrapped_lines):
+        y_pos = text_y + (i - len(wrapped_lines)/2) * 80
+        draw.text((width//2, y_pos), line, fill=(255, 255, 255), 
+                 anchor="mm", size=60)
+    
+    # Draw author
+    draw.text((width//2, height - 150), "- Jane Kariuki, Teen Psychologist", 
+             fill=(236, 72, 153), anchor="mm", size=30)
+    
+    # Draw brand
+    draw.text((width//2, height - 100), "@ParenTeenKenya", 
+             fill=(200, 200, 200), anchor="mm", size=25)
+    
+    # Convert to bytes
+    img_buffer = io.BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+    return img_buffer.getvalue()
 
 @app.get("/")
 async def home(request: Request):
-    # Fetch 5 quotes from Groq for the dashboard
-    ai_quotes = generate_groq_quotes() if GROQ_API_KEY else ["Listening is the first step to connection."]
-    return templates.TemplateResponse("index.html", {"request": request, "quotes": ai_quotes})
+    quotes = [
+        "Your teen is listening, even when they seem to ignore you.",
+        "Connection before correction - always.",
+        "Their rebellion is often a search for identity.",
+        "Listen to understand, not to reply.",
+        "Your calm is their anchor in emotional storms."
+    ]
+    return templates.TemplateResponse("index.html", {"request": request, "quotes": quotes})
 
-@app.post("/generate")
-async def handle_generate(quote: str = Form(...)):
-    video_path = create_video(quote)
-    with open(video_path, "rb") as f:
-        data = f.read()
-    os.remove(video_path)
-    return Response(content=data, media_type="video/mp4")
+@app.post("/analyze")
+async def analyze_youtube(youtube_url: str = Form(...)):
+    video_id = extract_video_id(youtube_url)
+    quotes = get_insightful_quotes(video_id)
+    return {"quotes": quotes, "video_id": video_id}
+
+@app.post("/generate-image")
+async def generate_image(quote: str = Form(...)):
+    image_data = create_quote_image(quote)
+    return Response(content=image_data, media_type="image/png")
+
+@app.get("/api/health")
+async def health():
+    return {"status": "healthy"}
